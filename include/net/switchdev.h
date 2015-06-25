@@ -48,6 +48,7 @@ enum switchdev_obj_id {
 	SWITCHDEV_OBJ_PORT_VLAN,
 	SWITCHDEV_OBJ_IPV4_FIB,
 	SWITCHDEV_OBJ_PORT_FDB,
+	SWITCHDEV_OBJ_PORT_BPF_PROG,
 };
 
 struct switchdev_obj {
@@ -74,6 +75,10 @@ struct switchdev_obj {
 			u16 vid;
 			u16 ndm_state;
 		} fdb;
+		struct switchdev_obj_bpf_prog {		/* PORT_BPF_PROG */
+			u32 len;
+			const struct bpf_insn *insnsi;
+		} bpf_prog;
 	} u;
 };
 
