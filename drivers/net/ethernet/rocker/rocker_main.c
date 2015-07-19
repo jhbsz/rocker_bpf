@@ -209,6 +209,8 @@ struct rocker_port {
 	struct net_device *dev;
 	struct net_device *bridge_dev;
 	struct rocker *rocker;
+	struct rocker_world *world;
+	void *world_port_priv;
 	unsigned int port_number;
 	u32 pport;
 	__be16 internal_vlan_id;
@@ -235,6 +237,7 @@ struct rocker {
 	spinlock_t cmd_ring_lock;		/* for cmd ring accesses */
 	struct rocker_dma_ring_info cmd_ring;
 	struct rocker_dma_ring_info event_ring;
+	struct list_head worlds;
 	DECLARE_HASHTABLE(flow_tbl, 16);
 	spinlock_t flow_tbl_lock;		/* for flow tbl accesses */
 	u64 flow_tbl_next_cookie;
@@ -2173,6 +2176,224 @@ static int rocker_cmd_group_tbl_del(const struct rocker_port *rocker_port,
 	return 0;
 }
 
+/**********************
+ * Worlds manipulation
+ **********************/
+
+static struct rocker_world_ops *rocker_world_ops[] = {
+};
+
+#define ROCKER_WORLD_OPS_LEN ARRAY_SIZE(rocker_world_ops)
+
+static const struct rocker_world_ops *__rocker_world_ops_find(const char *kind)
+{
+	struct rocker_world_ops *ops;
+	int i;
+
+	for (i = 0; i < ROCKER_WORLD_OPS_LEN; i++) {
+		ops = rocker_world_ops[i];
+		if (!strcmp(ops->kind, kind))
+			return ops;
+	}
+	return NULL;
+}
+
+struct rocker_world {
+	struct list_head list;
+	const struct rocker_world_ops *ops;
+	unsigned int ref;
+	unsigned long priv[0];
+};
+
+static struct rocker_world *__rocker_world_find(struct rocker *rocker,
+						const struct rocker_world_ops *ops)
+{
+	struct rocker_world *world;
+
+	list_for_each_entry(world, &rocker->worlds, list) {
+		if (world->ops == ops)
+			return world;
+	}
+	return NULL;
+}
+
+static int rocker_world_init(struct rocker *rocker, struct rocker_world *world)
+{
+	if (!world->ops->init)
+		return 0;
+	return world->ops->init(rocker, world->priv);
+}
+
+static void rocker_world_fini(struct rocker *rocker, struct rocker_world *world)
+{
+	if (!world->ops->fini)
+		return;
+	return world->ops->fini(rocker, world->priv);
+}
+
+static int rocker_world_get(struct rocker_port *rocker_port,
+			    const struct rocker_world_ops *ops)
+{
+	struct rocker *rocker = rocker_port->rocker;
+	struct rocker_world *world = __rocker_world_find(rocker, ops);
+	int err;
+
+	if (world)
+		goto ref_inc;
+	world = kzalloc(sizeof(*world) + ops->priv_size, GFP_KERNEL);
+	if (!world)
+		return -ENOMEM;
+
+	err = rocker_world_init(rocker, world);
+	if (err)
+		goto err_world_init;
+
+	list_add_tail(&world->list, &rocker->worlds);
+	rocker_port->world = world;
+ref_inc:
+	world->ref++;
+	return 0;
+
+err_world_init:
+	kfree(world);
+	return err;
+}
+
+static void rocker_world_put(struct rocker_port *rocker_port)
+{
+	struct rocker_world *world = rocker_port->world;
+	struct rocker *rocker = rocker_port->rocker;
+
+	world->ref--;
+	if (world->ref)
+		return;
+	list_del(&world->list);
+	rocker_world_fini(rocker, world);
+	kfree(world);
+	rocker_port->world = NULL;
+}
+
+static int rocker_world_port_init(struct rocker_port *rocker_port)
+{
+	struct rocker_world *world = rocker_port->world;
+
+	if (world->ops->port_init)
+		return world->ops->port_init(rocker_port, world->priv,
+					     rocker_port->world_port_priv);
+	return 0;
+}
+
+static void rocker_world_port_fini(struct rocker_port *rocker_port)
+{
+	struct rocker_world *world = rocker_port->world;
+
+	if (world->ops->port_fini)
+		world->ops->port_fini(rocker_port, world->priv,
+				      rocker_port->world_port_priv);
+}
+
+static int rocker_world_port_join(struct rocker_port *rocker_port,
+				  const struct rocker_world_ops *ops)
+{
+	int err;
+
+	err = rocker_world_get(rocker_port, ops);
+	if (err)
+		return err;
+	rocker_port->world_port_priv = kzalloc(ops->port_priv_size, GFP_KERNEL);
+	if (!rocker_port->world_port_priv) {
+		err = -ENOMEM;
+		goto err_alloc_port_priv;
+	}
+	err = rocker_cmd_set_port_settings_mode(rocker_port, ops->mode);
+	if (err)
+		goto err_set_mode;
+	err = rocker_world_port_init(rocker_port);
+	if (err)
+		goto err_port_init;
+	return 0;
+
+err_port_init:
+err_set_mode:
+	kfree(rocker_port->world_port_priv);
+err_alloc_port_priv:
+	rocker_world_put(rocker_port);
+	return err;
+}
+
+static void rocker_world_port_leave(struct rocker_port *rocker_port)
+{
+	rocker_world_port_fini(rocker_port);
+	kfree(rocker_port->world_port_priv);
+	rocker_world_put(rocker_port);
+}
+
+static int __rocker_port_change_world(struct rocker_port *rocker_port,
+				      const struct rocker_world_ops *ops)
+{
+	int err;
+
+	/* Check if mode was previously set and do cleanup if so */
+	if (rocker_port->world)
+		rocker_world_port_leave(rocker_port);
+	if (ops) {
+		err = rocker_world_port_join(rocker_port, ops);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int rocker_port_change_world(struct rocker_port *rocker_port,
+				    const char *kind)
+{
+	const struct rocker_world_ops *ops;
+	int err;
+
+	if (rocker_port->dev->flags & IFF_UP)
+		return -EBUSY;
+
+	if (rocker_port->world &&
+	    strcmp(rocker_port->world->ops->kind, kind) == 0) {
+		netdev_err(rocker_port->dev, "Unable to change to the same world the port is in\n");
+		return -EINVAL;
+	}
+
+	ops = __rocker_world_ops_find(kind);
+	if (!ops) {
+		netdev_err(rocker_port->dev, "World \"%s\" not found\n", kind);
+		return -EINVAL;
+	}
+
+	err = __rocker_port_change_world(rocker_port, ops);
+	if (err) {
+		netdev_err(rocker_port->dev, "Failed to change to world \"%s\"\n", kind);
+		return err;
+	}
+
+	netdev_info(rocker_port->dev, "World changed to \"%s\"\n", kind);
+	return 0;
+}
+
+static int rocker_world_port_open(struct rocker_port *rocker_port)
+{
+	struct rocker_world *world = rocker_port->world;
+
+	if (world->ops->port_open)
+		return world->ops->port_open(rocker_port, world->priv,
+					     rocker_port->world_port_priv);
+	return 0;
+}
+
+static void rocker_world_port_stop(struct rocker_port *rocker_port)
+{
+	struct rocker_world *world = rocker_port->world;
+
+	if (world->ops->port_stop)
+		world->ops->port_stop(rocker_port,  world->priv,
+				      rocker_port->world_port_priv);
+}
+
 /***************************************************
  * Flow, group, FDB, internal VLAN and neigh tables
  ***************************************************/
@@ -3825,6 +4046,11 @@ static int rocker_port_open(struct net_device *dev)
 	struct rocker_port *rocker_port = netdev_priv(dev);
 	int err;
 
+	if (!rocker_port->world) {
+		netdev_err(rocker_port->dev, "World not set\n");
+		return -EINVAL;
+	}
+
 	err = rocker_port_dma_rings_init(rocker_port);
 	if (err)
 		return err;
@@ -3845,6 +4071,12 @@ static int rocker_port_open(struct net_device *dev)
 		goto err_request_rx_irq;
 	}
 
+	err = rocker_world_port_open(rocker_port);
+	if (err) {
+		netdev_err(rocker_port->dev, "cannot open port in world\n");
+		goto err_world_port_open;
+	}
+
 	err = rocker_port_fwd_enable(rocker_port, SWITCHDEV_TRANS_NONE, 0);
 	if (err)
 		goto err_fwd_enable;
@@ -3857,6 +4089,7 @@ static int rocker_port_open(struct net_device *dev)
 	return 0;
 
 err_fwd_enable:
+err_world_port_open:
 	free_irq(rocker_msix_rx_vector(rocker_port), rocker_port);
 err_request_rx_irq:
 	free_irq(rocker_msix_tx_vector(rocker_port), rocker_port);
@@ -3873,6 +4106,7 @@ static int rocker_port_stop(struct net_device *dev)
 	rocker_port_set_enable(rocker_port, false);
 	napi_disable(&rocker_port->napi_rx);
 	napi_disable(&rocker_port->napi_tx);
+	rocker_world_port_stop(rocker_port);
 	rocker_port_fwd_disable(rocker_port, SWITCHDEV_TRANS_NONE,
 				ROCKER_OP_FLAG_NOWAIT);
 	free_irq(rocker_msix_rx_vector(rocker_port), rocker_port);
@@ -4912,6 +5146,7 @@ static int rocker_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	rocker = kzalloc(sizeof(*rocker), GFP_KERNEL);
 	if (!rocker)
 		return -ENOMEM;
+	INIT_LIST_HEAD(&rocker->worlds);
 
 	err = pci_enable_device(pdev);
 	if (err) {
