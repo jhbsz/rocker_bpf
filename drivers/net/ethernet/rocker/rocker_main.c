@@ -2181,6 +2181,7 @@ static int rocker_cmd_group_tbl_del(const struct rocker_port *rocker_port,
  **********************/
 
 static struct rocker_world_ops *rocker_world_ops[] = {
+	&rocker_ofdpa_ops,
 };
 
 #define ROCKER_WORLD_OPS_LEN ARRAY_SIZE(rocker_world_ops)

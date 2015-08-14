@@ -45,4 +45,6 @@ struct rocker_world_ops {
 			  void *port_priv);
 };
 
+extern struct rocker_world_ops rocker_ofdpa_ops;
+
 #endif
